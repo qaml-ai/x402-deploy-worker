@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { cdpPaymentMiddleware } from "x402-cdp";
+import { stripeApiKeyMiddleware } from "x402-stripe";
 import { extractParams } from "x402-ai";
 import { openapiFromMiddleware } from "x402-openapi";
 import { nanoid } from "nanoid";
@@ -66,11 +67,14 @@ const ROUTES = {
   },
 };
 
-app.use(
-  cdpPaymentMiddleware((env) => ({
+app.use(stripeApiKeyMiddleware({ serviceName: "deploy-worker" }));
+
+app.use(async (c, next) => {
+  if (c.get("skipX402")) return next();
+  return cdpPaymentMiddleware((env) => ({
     "POST /": { ...ROUTES["POST /"], accepts: [{ ...ROUTES["POST /"].accepts[0], payTo: env.SERVER_ADDRESS as `0x${string}` }] },
-  }))
-);
+  }))(c, next);
+});
 
 app.post("/", async (c) => {
   const body = await c.req.json<{ input?: string }>();
