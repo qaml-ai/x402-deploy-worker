@@ -1,95 +1,13 @@
 import { Hono } from "hono";
 import { cdpPaymentMiddleware } from "x402-cdp";
-import { describeRoute, openAPIRouteHandler } from "hono-openapi";
+import { extractParams } from "x402-ai";
+import { openapiFromMiddleware } from "x402-openapi";
 import { nanoid } from "nanoid";
 
 // TODO: When deployed workers run out of funding, serve an x402 payment page
 // instead of the worker, so any visitor can top up
 
 const app = new Hono<{ Bindings: Env }>();
-
-// ---------------------------------------------------------------------------
-// OpenAPI spec — must be before paymentMiddleware
-// ---------------------------------------------------------------------------
-app.get("/.well-known/openapi.json", openAPIRouteHandler(app, {
-  documentation: {
-    info: {
-      title: "x402 Deploy Worker Service",
-      description: "Deploy Cloudflare Workers by uploading code. Pay-per-use via x402 protocol on Base mainnet.",
-      version: "1.0.0",
-    },
-    servers: [{ url: "https://deploy.camelai.io" }],
-  },
-}));
-
-// ---------------------------------------------------------------------------
-// x402 payment gates
-// ---------------------------------------------------------------------------
-app.use(
-  cdpPaymentMiddleware(
-    (env) => ({
-      "POST /deploy": {
-        accepts: [
-          {
-            scheme: "exact",
-            price: "$0.10",
-            network: "eip155:8453",
-            payTo: env.SERVER_ADDRESS as `0x${string}`,
-          },
-        ],
-        description: "Deploy a Cloudflare Worker by uploading code",
-        mimeType: "application/json",
-        extensions: {
-          bazaar: {
-            discoverable: true,
-            inputSchema: {
-              bodyFields: {
-                code: {
-                  type: "string",
-                  description:
-                    "JavaScript or TypeScript source code for the Worker",
-                  required: true,
-                },
-                name: {
-                  type: "string",
-                  description:
-                    "Custom name for the worker (auto-generated if omitted)",
-                  required: false,
-                },
-              },
-            },
-          },
-        },
-      },
-      "GET /status/:name": {
-        accepts: [
-          {
-            scheme: "exact",
-            price: "$0.001",
-            network: "eip155:8453",
-            payTo: env.SERVER_ADDRESS as `0x${string}`,
-          },
-        ],
-        description: "Check if a deployed worker is active",
-        mimeType: "application/json",
-        extensions: {
-          bazaar: {
-            discoverable: true,
-            inputSchema: {
-              pathFields: {
-                name: {
-                  type: "string",
-                  description: "Name of the deployed worker",
-                  required: true,
-                },
-              },
-            },
-          },
-        },
-      },
-    })
-  )
-);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -101,50 +19,98 @@ function cfApiUrl(env: Env, scriptName: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// POST /deploy — deploy a worker ($0.10)
+// Route config
 // ---------------------------------------------------------------------------
-app.post("/deploy", describeRoute({
-  description: "Deploy a Cloudflare Worker by uploading code. Requires x402 payment ($0.10).",
-  requestBody: {
-    required: true,
-    content: {
-      "application/json": {
+
+const SYSTEM_PROMPT = `You are a parameter extractor for a Cloudflare Worker deployment service.
+Extract the following from the user's message and return JSON:
+- "action": either "deploy" (deploy new worker code) or "status" (check if a worker is active). Default "deploy". (required)
+- "code": the JavaScript or TypeScript source code for the Worker. (required for deploy)
+- "name": custom name for the worker. (optional, auto-generated if omitted)
+- "worker_name": name of the worker to check status for. Required if action is "status". (optional)
+
+Return ONLY valid JSON, no explanation.
+Examples:
+- {"action": "deploy", "code": "export default { fetch() { return new Response('hello') } }"}
+- {"action": "deploy", "code": "export default { fetch() { return new Response('hi') } }", "name": "my-worker"}
+- {"action": "status", "worker_name": "my-worker"}`;
+
+const ROUTES = {
+  "POST /": {
+    accepts: [{ scheme: "exact", price: "$0.10", network: "eip155:8453", payTo: "0x0" as `0x${string}` }],
+    description: "Deploy a Cloudflare Worker or check worker status. Send {\"input\": \"your request\"}",
+    mimeType: "application/json",
+    extensions: {
+      bazaar: {
+        info: {
+          input: {
+            type: "http",
+            method: "POST",
+            bodyType: "json",
+            body: {
+              input: { type: "string", description: "Describe what you want: deploy worker code or check status of a deployed worker", required: true },
+            },
+          },
+          output: { type: "json" },
+        },
         schema: {
-          type: "object",
-          required: ["code"],
           properties: {
-            code: { type: "string", description: "JavaScript or TypeScript source code for the Worker" },
-            name: { type: "string", description: "Custom name for the worker (auto-generated if omitted)" },
+            input: {
+              properties: { method: { type: "string", enum: ["POST"] } },
+              required: ["method"],
+            },
           },
         },
       },
     },
   },
-  responses: {
-    200: { description: "Worker deployed", content: { "application/json": { schema: { type: "object" } } } },
-    400: { description: "Missing or invalid code" },
-    402: { description: "Payment required" },
-    502: { description: "Deployment failed" },
-  },
-}), async (c) => {
-  const contentType = c.req.header("content-type") || "";
+};
 
-  let code: string | undefined;
-  let name: string | undefined;
+app.use(
+  cdpPaymentMiddleware((env) => ({
+    "POST /": { ...ROUTES["POST /"], accepts: [{ ...ROUTES["POST /"].accepts[0], payTo: env.SERVER_ADDRESS as `0x${string}` }] },
+  }))
+);
 
-  if (contentType.includes("multipart/form-data")) {
-    const formData = await c.req.formData();
-    code = formData.get("code")?.toString();
-    name = formData.get("name")?.toString();
-  } else {
-    // Also accept JSON body for convenience
-    const body = await c.req.json<{ code?: string; name?: string }>();
-    code = body.code;
-    name = body.name;
+app.post("/", async (c) => {
+  const body = await c.req.json<{ input?: string }>();
+  if (!body?.input) {
+    return c.json({ error: "Missing 'input' field" }, 400);
   }
 
+  const params = await extractParams(c.env.CF_GATEWAY_TOKEN, SYSTEM_PROMPT, body.input);
+  const action = ((params.action as string) || "deploy").toLowerCase();
+
+  if (action === "status") {
+    const workerName = params.worker_name as string;
+    if (!workerName) {
+      return c.json({ error: "Could not determine worker_name to check status" }, 400);
+    }
+
+    const cfRes = await fetch(cfApiUrl(c.env, workerName), {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${c.env.CF_API_TOKEN}`,
+      },
+    });
+
+    if (cfRes.status === 404) {
+      return c.json({ name: workerName, active: false });
+    }
+
+    const cfBody = await cfRes.json<{ success: boolean }>();
+
+    return c.json({
+      name: workerName,
+      active: cfBody.success === true,
+    });
+  }
+
+  // Default: deploy
+  const code = params.code as string | undefined;
+
   if (!code || code.trim().length === 0) {
-    return c.json({ error: "Missing or empty 'code' field" }, 400);
+    return c.json({ error: "Could not extract worker code from your input" }, 400);
   }
 
   if (code.length > MAX_CODE_SIZE) {
@@ -154,7 +120,7 @@ app.post("/deploy", describeRoute({
     );
   }
 
-  const scriptName = name?.trim() || nanoid(12);
+  const scriptName = (params.name as string)?.trim() || nanoid(12);
 
   // Build multipart form data for the Cloudflare API upload.
   // The Workers API expects a "worker.js" part with the script content
@@ -205,47 +171,9 @@ app.post("/deploy", describeRoute({
 });
 
 // ---------------------------------------------------------------------------
-// GET /status/:name — check worker status ($0.001)
-// ---------------------------------------------------------------------------
-app.get("/status/:name", describeRoute({
-  description: "Check if a deployed worker is active. Requires x402 payment ($0.001).",
-  responses: {
-    200: { description: "Worker status", content: { "application/json": { schema: { type: "object" } } } },
-    402: { description: "Payment required" },
-  },
-}), async (c) => {
-  const scriptName = c.req.param("name");
-
-  const cfRes = await fetch(cfApiUrl(c.env, scriptName), {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${c.env.CF_API_TOKEN}`,
-    },
-  });
-
-  if (cfRes.status === 404) {
-    return c.json({ name: scriptName, active: false });
-  }
-
-  const cfBody = await cfRes.json<{ success: boolean }>();
-
-  return c.json({
-    name: scriptName,
-    active: cfBody.success === true,
-  });
-});
-
-// ---------------------------------------------------------------------------
 // DELETE /undeploy/:name — remove a worker (free)
 // ---------------------------------------------------------------------------
-app.delete("/undeploy/:name", describeRoute({
-  description: "Remove a deployed worker (free).",
-  responses: {
-    200: { description: "Worker deleted", content: { "application/json": { schema: { type: "object" } } } },
-    404: { description: "Worker not found" },
-    502: { description: "Failed to delete worker" },
-  },
-}), async (c) => {
+app.delete("/undeploy/:name", async (c) => {
   const scriptName = c.req.param("name");
 
   const cfRes = await fetch(cfApiUrl(c.env, scriptName), {
@@ -268,25 +196,17 @@ app.delete("/undeploy/:name", describeRoute({
   return c.json({ name: scriptName, deleted: true });
 });
 
-// ---------------------------------------------------------------------------
-// Health / info
-// ---------------------------------------------------------------------------
-app.get("/", describeRoute({
-  description: "Health check and service info.",
-  responses: {
-    200: { description: "Service info", content: { "application/json": { schema: { type: "object" } } } },
-  },
-}), (c) => {
+app.get("/.well-known/openapi.json", openapiFromMiddleware("x402 Deploy Worker", "deploy.camelai.io", ROUTES));
+
+app.get("/", (c) => {
   return c.json({
     service: "x402-deploy-worker",
-    description:
-      "Deploy Cloudflare Workers by uploading code. Pay per deploy via x402.",
+    description: 'Deploy Cloudflare Workers by uploading code. Send POST / with {"input": "deploy this worker: export default { fetch() { return new Response(\'hello\') } }"}',
+    price: "$0.10 per request (Base mainnet)",
     endpoints: {
-      "POST /deploy": "$0.10 — upload code, get a live worker URL",
-      "GET /status/:name": "$0.001 — check if a worker is active",
+      "POST /": "$0.10",
       "DELETE /undeploy/:name": "free — remove a deployed worker",
     },
-    network: "Base mainnet (eip155:8453)",
   });
 });
 
